@@ -1,7 +1,11 @@
 import os
 import sqlite3
 import httpx
+import contextvars
+from functools import wraps
 from datetime import datetime, date, timedelta
+import uuid
+import re
 from pathlib import Path
 
 from telegram import (
@@ -16,6 +20,8 @@ from telegram.ext import (
 TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 AI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+OWNER_TELEGRAM_ID = os.getenv("OWNER_TELEGRAM_ID", "").strip()
+_current_db = contextvars.ContextVar("current_user_db", default=None)
 if not TOKEN:
     raise RuntimeError("Set BOT_TOKEN in the hosting panel environment variables.")
 
@@ -24,7 +30,30 @@ DATA_DIR = Path("/app/data")
 if not DATA_DIR.exists():
     DATA_DIR = Path("data")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-DB_PATH = DATA_DIR / "ozonamon.db"
+DB_PATH = DATA_DIR / "ozonamon.db"  # Старая база владельца — сохраняется без изменений.
+USER_DB_DIR = DATA_DIR / "users"
+USER_DB_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def user_database(func):
+    """Каждый Telegram-пользователь работает со своей SQLite-базой."""
+    @wraps(func)
+    async def wrapped(update, context, *args, **kwargs):
+        user = update.effective_user
+        if user is None:
+            return await func(update, context, *args, **kwargs)
+        # Если ID владельца задан, ему сохраняем старую базу; остальным — отдельные.
+        if OWNER_TELEGRAM_ID and str(user.id) == OWNER_TELEGRAM_ID:
+            path = DB_PATH
+        else:
+            path = USER_DB_DIR / f"{user.id}.db"
+        token = _current_db.set(path)
+        try:
+            init_db()
+            return await func(update, context, *args, **kwargs)
+        finally:
+            _current_db.reset(token)
+    return wrapped
 
 MENU = ReplyKeyboardMarkup(
     [
@@ -33,7 +62,8 @@ MENU = ReplyKeyboardMarkup(
         [KeyboardButton("🛒 Продажа"), KeyboardButton("↩️ Возврат")],
         [KeyboardButton("💸 Расход"), KeyboardButton("📊 Статистика")],
         [KeyboardButton("📜 История"), KeyboardButton("🧹 Сбросить продажи")],
-        [KeyboardButton("📅 Продажа за день")],
+        [KeyboardButton("📅 Продажа за день"), KeyboardButton("📊 Отчёт за дату")],
+        [KeyboardButton("🧮 Юнит-экономика")],
         [KeyboardButton("🔎 Поиск товара"), KeyboardButton("🤖 ИИ-помощник")],
         [KeyboardButton("⬅️ Назад"), KeyboardButton("🏠 Главное меню")],
     ],
@@ -54,7 +84,8 @@ NAV_BUTTONS = [
 ]
 
 def connect():
-    conn = sqlite3.connect(DB_PATH)
+    db_path = _current_db.get() or DB_PATH
+    conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -73,8 +104,13 @@ def init_db():
             qty INTEGER NOT NULL DEFAULT 0,
             amount REAL NOT NULL DEFAULT 0,
             note TEXT,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            order_id TEXT
         )""")
+        # Безопасная миграция старой базы: существующие операции не удаляются.
+        columns = {row["name"] for row in c.execute("PRAGMA table_info(operations)")}
+        if "order_id" not in columns:
+            c.execute("ALTER TABLE operations ADD COLUMN order_id TEXT")
 
 def now():
     return datetime.now().isoformat(timespec="seconds")
@@ -90,13 +126,13 @@ def get_product(product_id):
     with connect() as c:
         return c.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
 
-def save_op(kind, product_name=None, qty=0, amount=0, note=None):
+def save_op(kind, product_name=None, qty=0, amount=0, note=None, order_id=None):
     with connect() as c:
         cur = c.execute(
             """INSERT INTO operations
-            (kind, product_name, qty, amount, note, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)""",
-            (kind, product_name, int(qty), float(amount), note, now())
+            (kind, product_name, qty, amount, note, created_at, order_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (kind, product_name, int(qty), float(amount), note, now(), order_id)
         )
         return cur.lastrowid
 
@@ -161,6 +197,7 @@ def stats_text(period):
         "а не выручка или бухгалтерская чистая прибыль."
     )
 
+@user_database
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text(
@@ -170,6 +207,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=MENU
     )
 
+@user_database
 async def show_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = product_rows()
     if not rows:
@@ -178,6 +216,7 @@ async def show_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [f"• {r['name']} — {money(r['unit_cost'])}/шт." for r in rows]
     await update.message.reply_text("📦 Товары в каталоге:\n\n" + "\n".join(lines), reply_markup=MENU)
 
+@user_database
 async def add_product_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["flow"] = "add_name"
     await update.message.reply_text("Введите название нового товара:", reply_markup=INPUT_MENU)
@@ -189,30 +228,35 @@ async def begin_product_action(query, context, action, title):
         return
     await query.message.reply_text(title, reply_markup=keyboard)
 
+@user_database
 async def begin_sale(update, context):
     await update.message.reply_text(
         "🛒 Выберите товар для продажи:",
         reply_markup=product_keyboard("sale") or cancel_keyboard()
     )
 
+@user_database
 async def begin_return(update, context):
     await update.message.reply_text(
         "↩️ Выберите товар, который вернули:",
         reply_markup=product_keyboard("return") or cancel_keyboard()
     )
 
+@user_database
 async def begin_cost_change(update, context):
     await update.message.reply_text(
         "💰 Выберите товар, у которого нужно изменить себестоимость:",
         reply_markup=product_keyboard("cost") or cancel_keyboard()
     )
 
+@user_database
 async def begin_delete_product(update, context):
     await update.message.reply_text(
         "🗑 Выберите товар для удаления:",
         reply_markup=product_keyboard("delete_product") or cancel_keyboard()
     )
 
+@user_database
 async def begin_expense(update, context):
     context.user_data["flow"] = "expense_name"
     await update.message.reply_text(
@@ -220,11 +264,13 @@ async def begin_expense(update, context):
         reply_markup=INPUT_MENU
     )
 
+@user_database
 async def begin_search(update, context):
     context.user_data["flow"] = "search"
     await update.message.reply_text("Введите название или часть названия товара:", reply_markup=INPUT_MENU)
 
 
+@user_database
 async def begin_ai_assistant(update, context):
     context.user_data["flow"] = "ai_question"
     await update.message.reply_text(
@@ -288,6 +334,7 @@ async def ask_ai(question, context):
         return "Не удалось связаться с ИИ-сервисом. Попробуйте позже."
 
 
+@user_database
 async def begin_batch_sale(update, context):
     rows = product_rows()
     if not rows:
@@ -319,6 +366,7 @@ async def send_batch_sale_picker(message, context):
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
+@user_database
 async def show_history(update, context):
     with connect() as c:
         rows = c.execute("SELECT * FROM operations ORDER BY id DESC LIMIT 15").fetchall()
@@ -344,6 +392,7 @@ async def show_history(update, context):
     buttons.append([InlineKeyboardButton("Закрыть", callback_data="cancel")])
     await update.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
 
+@user_database
 async def show_stats(update, context):
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("Сегодня", callback_data="stats:day"),
@@ -354,6 +403,7 @@ async def show_stats(update, context):
     ])
     await update.message.reply_text(stats_text("day"), reply_markup=keyboard)
 
+@user_database
 async def begin_reset_sales(update, context):
     with connect() as c:
         count = c.execute("SELECT COUNT(*) FROM operations WHERE kind='sale'").fetchone()[0]
@@ -370,10 +420,72 @@ async def begin_reset_sales(update, context):
         reply_markup=keyboard
     )
 
+@user_database
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data or ""
+
+    if data == "unit_back":
+        step = context.user_data.get("unit_step")
+        if step is None:
+            await query.message.reply_text("Расчёт не найден. Начните заново.", reply_markup=MENU)
+            return
+        if step <= 0:
+            context.user_data.pop("flow", None)
+            context.user_data.pop("unit_data", None)
+            context.user_data.pop("unit_step", None)
+            await query.message.reply_text("Возврат в главное меню.", reply_markup=MENU)
+            return
+        context.user_data["unit_step"] = step - 1
+        await unit_prompt(query.message, context)
+        return
+
+    if data.startswith("unit_set:"):
+        _, field, value = data.split(":", 2)
+        d = context.user_data.setdefault("unit_data", {})
+        if field == "scheme":
+            d[field] = value
+        elif field == "tax_system":
+            d[field] = value
+            context.user_data["unit_step"] = 7
+            await query.message.reply_text(f"Шаг 7. Налоги ({value}). Выберите ставку:", reply_markup=unit_step_keyboard("tax_rate"))
+            return
+        elif field in ("tax_rate", "vat", "spp"):
+            d[field] = float(value)
+        context.user_data["unit_step"] = min(context.user_data.get("unit_step", 0) + 1, 12)
+        if context.user_data["unit_step"] >= 12:
+            await finish_unit_calc(query.message, context)
+        else:
+            await unit_prompt(query.message, context)
+        return
+
+    if data == "unit_manual_tax":
+        context.user_data["flow"] = "unit_manual_tax_system"
+        await query.message.reply_text("Введите название системы налогообложения:", reply_markup=INPUT_MENU)
+        return
+    if data.startswith("unit_manual:"):
+        field = data.split(":", 1)[1]
+        context.user_data["flow"] = "unit_manual_" + field
+        await query.message.reply_text("Введите процент числом, например 6 или 20:", reply_markup=INPUT_MENU)
+        return
+    if data.startswith("unit_edit:"):
+        field = data.split(":", 1)[1]
+        fields = [x[0] for x in UNIT_STEPS]
+        context.user_data["unit_step"] = fields.index(field)
+        context.user_data["flow"] = "unit_calc"
+        await unit_prompt(query.message, context)
+        return
+    if data == "unit_new":
+        context.user_data["flow"] = "unit_calc"
+        context.user_data["unit_data"] = {}
+        context.user_data["unit_step"] = 0
+        await unit_prompt(query.message, context)
+        return
+    if data == "unit_menu":
+        context.user_data.clear()
+        await query.message.reply_text("Главное меню.", reply_markup=MENU)
+        return
 
     if data == "main_menu":
         context.user_data.clear()
@@ -427,10 +539,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_qty = 0
         total_cost = 0.0
         lines = []
+        order_id = uuid.uuid4().hex
         for item in items:
             qty = int(item["qty"])
             amount = qty * float(item["unit_cost"])
-            save_op("sale", item["name"], qty, amount, "Дневная продажа")
+            save_op("sale", item["name"], qty, amount, "Дневная продажа", order_id=order_id)
             total_qty += qty
             total_cost += amount
             lines.append(f"• {item['name']} — {qty} шт. = {money(amount)}")
@@ -558,6 +671,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+@user_database
 async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     flow = context.user_data.get("flow")
@@ -584,7 +698,7 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     menu_actions = {
         "📦 Товары", "➕ Добавить товар", "💰 Изменить себестоимость",
         "🗑 Удалить товар", "🛒 Продажа", "↩️ Возврат", "💸 Расход",
-        "📊 Статистика", "📜 История", "🧹 Сбросить продажи", "🔎 Поиск товара", "📅 Продажа за день", "🤖 ИИ-помощник"
+        "📊 Статистика", "📜 История", "🧹 Сбросить продажи", "🔎 Поиск товара", "📅 Продажа за день", "📊 Отчёт за дату", "🧮 Юнит-экономика", "🤖 ИИ-помощник"
     }
     if text in menu_actions:
         context.user_data.clear()
@@ -600,6 +714,13 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await begin_sale(update, context)
         elif text == "📅 Продажа за день":
             await begin_batch_sale(update, context)
+        elif text == "📊 Отчёт за дату":
+            await begin_date_report(update, context)
+        elif text == "🧮 Юнит-экономика":
+            context.user_data["flow"] = "unit_calc"
+            context.user_data["unit_data"] = {}
+            context.user_data["unit_step"] = 0
+            await unit_prompt(update.message, context)
         elif text == "↩️ Возврат":
             await begin_return(update, context)
         elif text == "💸 Расход":
@@ -614,6 +735,73 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await begin_search(update, context)
         elif text == "🤖 ИИ-помощник":
             await begin_ai_assistant(update, context)
+        return
+
+    if flow == "report_date":
+        try:
+            day = datetime.strptime(text, "%Y-%m-%d").date().isoformat()
+        except ValueError:
+            await update.message.reply_text("Неверный формат. Введите дату как 2026-11-02.")
+            return
+        context.user_data.clear()
+        await update.message.reply_text(daily_report_text(day), reply_markup=MENU)
+        return
+
+    if flow == "unit_manual_tax_system":
+        if len(text) > 30:
+            await update.message.reply_text("Слишком длинное название. Введите коротко, например ОСНО.")
+            return
+        context.user_data.setdefault("unit_data", {})["tax_system"] = text
+        context.user_data["unit_step"] = 7
+        context.user_data["flow"] = "unit_calc"
+        await update.message.reply_text("Введите ставку налога в процентах:", reply_markup=INPUT_MENU)
+        context.user_data["flow"] = "unit_manual_tax_rate"
+        return
+
+    if flow and flow.startswith("unit_manual_"):
+        field = flow.replace("unit_manual_", "")
+        try:
+            value = float(text.replace(" ", "").replace(",", ".").replace("%", ""))
+            if value < 0 or value > 100:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("Введите процент от 0 до 100, например 6.")
+            return
+        context.user_data.setdefault("unit_data", {})[field] = value
+        context.user_data["flow"] = "unit_calc"
+        context.user_data["unit_step"] = 8 if field == "tax_rate" else context.user_data.get("unit_step", 0) + 1
+        await unit_prompt(update.message, context)
+        return
+
+    if flow == "unit_calc":
+        step = context.user_data.get("unit_step", 0)
+        field = UNIT_STEPS[step][0]
+        d = context.user_data.setdefault("unit_data", {})
+        try:
+            if field == "category":
+                if not text or len(text) > 120: raise ValueError
+                d[field] = text
+            elif field in ("cost", "drr", "spp", "buyout", "price", "packing", "extra"):
+                value = float(text.replace(" ", "").replace(",", ".").replace("₽", "").replace("%", ""))
+                if value < 0 or (field in ("drr", "spp", "buyout") and value > 100): raise ValueError
+                if field == "buyout" and value == 0: raise ValueError
+                d[field] = value
+            elif field == "volume":
+                d[field] = parse_volume(text)
+            elif field == "tax_rate":
+                value = float(text.replace(",", ".").replace("%", ""))
+                if not 0 <= value <= 100: raise ValueError
+                d[field] = value
+            elif field in ("scheme", "tax_system", "vat"):
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("Проверьте значение и попробуйте ещё раз.")
+            return
+        context.user_data["unit_step"] = step + 1
+        if context.user_data["unit_step"] >= len(UNIT_STEPS):
+            await finish_unit_calc(update.message, context)
+        else:
+            await unit_prompt(update.message, context)
         return
 
     if flow == "add_name":
@@ -711,7 +899,7 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         amount = qty * float(p["unit_cost"])
         kind = "sale" if flow == "sale_qty" else "return"
-        save_op(kind, p["name"], qty, amount)
+        save_op(kind, p["name"], qty, amount, order_id=uuid.uuid4().hex if kind == "sale" else None)
         if kind == "sale":
             message = (
                 f"✅ Продажа записана\n{p['name']} — {qty} шт.\n"
@@ -753,6 +941,7 @@ async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("Выберите действие в меню ниже.", reply_markup=MENU)
 
+@user_database
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Используйте кнопки меню. «⬅️ Назад» возвращает к предыдущему шагу, «🏠 Главное меню» — в меню.\n"
@@ -760,11 +949,21 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=MENU
     )
 
+@user_database
+async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"Ваш Telegram ID: {update.effective_user.id}\\n"
+        "Этот номер можно указать в OWNER_TELEGRAM_ID в Bothost, "
+        "чтобы сохранить доступ к прежней базе владельца."
+    )
+
+
 def main():
     init_db()
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("myid", my_id))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, process_text))
     app.run_polling()
